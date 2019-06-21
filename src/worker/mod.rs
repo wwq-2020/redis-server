@@ -104,18 +104,20 @@ impl Worker {
 
     fn on_accept(&mut self) {
         let mut max = MAX_ACCEPTS_PER_CALL;
-        (0..MAX_ACCEPTS_PER_CALL).for_each(|_| match self.accept() {
-            Ok(_) => max -= 1,
-            Err(e) => match e.kind() {
-                WouldBlock => return,
-                _ => {
-                    println!("server_id:{:?}, on_accept err:{:?}", self.server_id, e);
-                    return;
-                }
-            },
-        });
-
+        for _ in 0..MAX_ACCEPTS_PER_CALL {
+            match self.accept() {
+                Ok(_) => max -= 1,
+                Err(e) => match e.kind() {
+                    WouldBlock => return,
+                    _ => {
+                        println!("server_id:{:?}, on_accept err:{:?}", self.server_id, e);
+                        return;
+                    }
+                },
+            };
+        }
     }
+
 
     fn on_data(&mut self, token: usize) {
         let client = match self.conns.get_mut(&token) {
