@@ -107,7 +107,7 @@ impl Worker {
         (0..MAX_ACCEPTS_PER_CALL).for_each(|_| match self.accept() {
             Ok(_) => max -= 1,
             Err(e) => match e.kind() {
-                WouldBlock => {}
+                WouldBlock => return,
                 _ => {
                     println!("server_id:{:?}, on_accept err:{:?}", self.server_id, e);
                     return;
