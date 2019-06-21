@@ -224,7 +224,7 @@ impl Client {
     fn process_command(&mut self) -> Result<(), Error> {
         let mut db = self.db.lock().unwrap();
 
-        let resp = db.process_command(&self.arg.clone())?;
+        let resp = db.process_command(&self.arg)?;
         self.stream.write(resp)?;
         Ok(())
     }
