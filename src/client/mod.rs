@@ -1,13 +1,16 @@
-use mio::net::TcpStream;
+
 use std::io::{Read, Write};
+use tokio::net::TcpStream;
 
 use super::error::{Error, RedisError};
 const PROTO_IOBUF_LEN: i64 = 16 << 10;
 use super::common::AM;
+use std::io::ErrorKind::WouldBlock;
 
 use super::common::OK;
 use super::db::DB;
 use std::io;
+use tokio::prelude::*;
 
 enum ReqType {
     Init,
@@ -45,15 +48,18 @@ impl Client {
     }
 
     pub fn read_command(&mut self) -> Result<(), Error> {
-
         let size = self
             .stream
             .read(&mut self.query_buf[self.buf_len as usize..])?;
 
-        if size == 0 {
-            return Err(Error::Io(io::Error::new(io::ErrorKind::UnexpectedEof,"eof")));
-        }
 
+        if size == 0 {
+            println!("eof");
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "eof",
+            )));
+        }
 
         self.buf_len += size as i64;
         return self.process_input_buffer();
@@ -83,6 +89,7 @@ impl Client {
 
     fn process_input_buffer(&mut self) -> Result<(), Error> {
         while self.query_pos < self.buf_len {
+
             if !self.process_input_buffer_each()? {
                 return Ok(());
             }
@@ -94,6 +101,7 @@ impl Client {
                 self.bulklen = -1;
                 break;
             } else {
+
                 self.process_command()?
             }
             self.req_type = ReqType::Init;
@@ -222,10 +230,43 @@ impl Client {
     }
 
     fn process_command(&mut self) -> Result<(), Error> {
+
         let mut db = self.db.lock().unwrap();
 
         let resp = db.process_command(&self.arg.clone())?;
-        self.stream.write(resp)?;
+
+        match self.stream.write(resp) {
+            Ok(_) => {}
+            Err(e) => {
+                println!("send err");
+            }
+        };
         Ok(())
+    }
+}
+
+impl Future for Client {
+    type Item = ();
+    type Error = Error;
+    fn poll(&mut self) -> Poll<(), Error> {
+        match self.read_command() {
+            Ok(_) => {
+                return Ok(Async::Ready(()));
+            }
+            Err(Error::Io(e)) => match e.kind() {
+                WouldBlock => {
+                    return Ok(Async::NotReady);
+                }
+                _ => {
+                    println!("io:err{:?}", e);
+                    return Err(Error::Io(e));
+                }
+            },
+            Err(e) => {
+                println!("other err{:?}", e);
+                return Err(e);
+            }
+        }
+
     }
 }

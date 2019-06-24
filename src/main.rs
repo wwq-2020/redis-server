@@ -1,54 +1,39 @@
-use mio::net::TcpListener;
-// use num_cpus;
-use std::sync::{Arc, Mutex};
-//use std::thread;
-
-
-mod worker;
-use worker::Worker;
-
+use std::io;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::prelude::*;
 mod client;
+use client::Client;
+use std::sync::{Arc, Mutex};
 
-mod server;
-use server::Server;
+use net2::unix::UnixTcpBuilderExt;
+use net2::TcpBuilder;
 
-mod config;
-use config::parse_config;
+use std::net::SocketAddr;
 
+mod common;
 mod db;
 use db::DB;
-
 mod error;
-use error::Error;
-mod common;
+pub const OK: &str = "+OK\r\n";
 
-fn main() -> Result<(), Error> {
-    let config = parse_config();
-    let addr = config.addr.parse()?;
-    let listener = TcpListener::bind(&addr)?;
+fn main() {
+    let addr: SocketAddr = "0.0.0.0:6379".parse().unwrap();
+    let listener = TcpListener::bind(&addr).expect("unable to bind TCP listener");
 
-    let server = Arc::new(Mutex::new(Server::new()));
     let db = Arc::new(Mutex::new(DB::new()));
-    let mut worker = Worker::new(listener, server, db, 1, true).unwrap();
-    worker.run();
-    // let num = num_cpus::get();
-    // let mut threads: Vec<_> = Vec::with_capacity(num);
-    // for id in 0..num {
-    //     let is_main_thread = id == num - 1;
-    //     let listener = listener.try_clone()?;
-    //     let server = server.clone();
-    //     let db = db.clone();
-    //     let mut worker = Worker::new(listener, server, db, id, is_main_thread)?;
-    //     let thread = thread::spawn(move || worker.run());
-    //     threads.push(thread);
-    // }
+    let client_id = Arc::new(Mutex::new(1));
+    let server = listener
+        .incoming()
+        .map_err(|e| eprintln!("accept failed = {:?}", e))
+        .for_each(move |sock| {
+            let db = db.clone();
+            let mut client_id = client_id.lock().unwrap();
+            *client_id += 1;
 
-    // for t in threads {
-    //     match t.join() {
-    //         Ok(_) => {}
-    //         Err(e) => println!("join err:{:?}", e),
-    //     };
-    // }
+            let client = Client::new(sock, *client_id, db).map_err(|err| eprintln!("err{:?}", err));
+            tokio::spawn(client);
+            Ok(())
+        });
 
-    Ok(())
+    tokio::run(server);
 }
