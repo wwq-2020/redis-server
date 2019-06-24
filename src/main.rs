@@ -19,7 +19,6 @@ pub const OK: &str = "+OK\r\n";
 fn main() {
     let addr: SocketAddr = "0.0.0.0:6379".parse().unwrap();
     let listener = TcpListener::bind(&addr).expect("unable to bind TCP listener");
-
     let db = Arc::new(Mutex::new(DB::new()));
     let client_id = Arc::new(Mutex::new(1));
     let server = listener

@@ -177,7 +177,7 @@ impl Client {
                 let buf = &self.query_buf[self.query_pos as usize..self.buf_len as usize];
                 let idx = match buf.into_iter().position(|e| e == &('\r' as u8)) {
                     Some(idx) => idx,
-                    _ => break,
+                    _ => return Ok(false),
                 };
 
                 if idx as i64 - self.query_pos > self.buf_len - self.query_pos - 2 {
