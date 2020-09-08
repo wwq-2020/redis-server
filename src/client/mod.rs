@@ -1,116 +1,190 @@
-
 use super::common::AM;
-use super::db::{Command, DB};
-use futures::{try_ready, Sink, Stream};
-use std::collections::VecDeque;
-use std::fmt::Debug;
-use tokio::prelude::*;
+use super::db::{CmdReq, DB};
+use super::error::{Error, RedisError};
+use memchr::memchr;
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
-use super::server::Server;
-
-
-use super::error::Error;
-
-pub struct Client<I, O, S, R>
-where
-    I: Stream<Item = S, Error = Error>,
-    O: Sink<SinkItem = R, SinkError = Error>,
-    S: Command<R, Error>,
-{
-    sink: O,
-    stream: I,
-    cmds: VecDeque<S>,
-    _id: i64,
-    pending: bool,
+pub struct Client {
+    id: i64,
+    conn: TcpStream,
+    read_buf: Vec<u8>,
+    write_buf: Vec<u8>,
+    read_pos: usize,
+    data_pos: usize,
+    req_type: ReqType,
+    multibulklen: i64,
+    bulklen: i64,
     db: AM<DB>,
-    _server: AM<Server>,
+    req: CmdReq,
 }
 
+enum ReqType {
+    Init,
+    MULTIBULK,
+    INLINE,
+}
 
-impl<I, O, S, R> Client<I, O, S, R>
-where
-    I: Stream<Item = S, Error = Error>,
-    O: Sink<SinkItem = R, SinkError = Error>,
-    S: Command<R, Error>,
-{
-    pub fn new(sink: O, stream: I, id: i64, db: AM<DB>, server: AM<Server>) -> Client<I, O, S, R> {
+impl Client {
+    pub fn new(id: i64, conn: TcpStream, db: AM<DB>) -> Client {
         Client {
-            sink: sink,
-            stream: stream,
-            _id: id,
-            cmds: VecDeque::new(),
-            pending: false,
+            id: id,
+            conn: conn,
+            read_buf: [0_u8; 4096].to_vec(),
+            write_buf: Vec::with_capacity(4096),
+            read_pos: 0,
+            data_pos: 0,
+            req_type: ReqType::Init,
+            multibulklen: 0,
+            bulklen: -1,
             db: db,
-            _server: server,
+            req: CmdReq::new(),
         }
-
     }
 }
 
-impl<I, O, S, R> Future for Client<I, O, S, R>
-where
-    I: Stream<Item = S, Error = Error>,
-    O: Sink<SinkItem = R, SinkError = Error>,
-    S: Command<R, Error> + Debug,
-{
-    type Item = ();
-    type Error = Error;
-    fn poll(&mut self) -> Poll<(), Error> {
-        // Ok(Async::Ready(()))
-
-        let mut can_read = true;
-        let mut can_send = true;
+impl Client {
+    pub async fn serve(&mut self) -> Result<(), Error> {
         loop {
-            if !can_read && !can_send {
-                return Ok(Async::NotReady);
+            let n = self.conn.read(&mut self.read_buf).await?;
+            if n == 0 {
+                return Err(Error::Redis(RedisError::new()));
             }
-
-            if can_read {
-                loop {
-                    match self.stream.poll() {
-                        Ok(Async::Ready(Some(req))) => {
-                            self.cmds.push_back(req);
-                        }
-                        Ok(Async::Ready(None)) => {
-                            can_read = false;
-                            break;
-                        }
-                        Ok(Async::NotReady) => {
-                            can_read = false;
-                            break;
-                        }
-                        Err(e) => {
-                            return Err(e);
-                        }
+            self.data_pos += n;
+            self.req_type = match self.req_type {
+                ReqType::Init => {
+                    if self.read_buf[self.read_pos] == '*' as u8 {
+                        ReqType::MULTIBULK
+                    } else {
+                        ReqType::INLINE
                     }
                 }
-
-            }
-            if self.cmds.is_empty() {
-                can_send = false;
-                continue;
-            }
-            if can_send {
-                while !self.cmds.is_empty() {
-                    let mut req = self.cmds.pop_front().unwrap();
-                    let resp = req.exec(self.db.clone())?;
-                    match self.sink.start_send(resp)? {
-                        AsyncSink::NotReady(_) => {
-                            can_send = false;
-                            break;
-                        }
-                        AsyncSink::Ready => {
-
-                            self.pending = true;
-                        }
-                    }
+                ReqType::INLINE => ReqType::INLINE,
+                ReqType::MULTIBULK => ReqType::MULTIBULK,
+            };
+            let cmd_req = match self.req_type {
+                ReqType::MULTIBULK => self.process_multibulk_buffer()?,
+                ReqType::INLINE => self.process_inline_buffer()?,
+                _ => panic!("nerver reached"),
+            };
+            match cmd_req {
+                Some(mut cmd_req) => {
+                    let cmd_resp = cmd_req.exec(self.db.clone())?;
+                    self.conn.write_all(cmd_resp.as_bytes()).await?;
+                    self.conn.flush().await?;
+                    self.data_pos = self.data_pos - self.read_pos;
+                    self.read_pos = 0;
                 }
-                if self.pending {
-
-                    try_ready!(self.sink.poll_complete());
-                    self.pending = false;
-                }
+                None => continue,
             }
         }
+    }
+
+    fn process_inline_buffer(&mut self) -> Result<Option<CmdReq>, Error> {
+        Ok(Some(CmdReq::new()))
+    }
+
+    fn process_multibulk_buffer(&mut self) -> Result<Option<CmdReq>, Error> {
+        if self.multibulklen == 0 {
+            let idx = match memchr('\r' as u8, self.cur_data()) {
+                Some(idx) => idx,
+                _ => {
+                    return Ok(None);
+                }
+            };
+
+            if self.peek() != '*' as u8 {
+                return Err(Error::Redis(RedisError::new()));
+            }
+
+            if idx == self.read_buf.len() - 1 {
+                return Ok(None);
+            }
+
+            let mut multibulklen: i64 = 0;
+
+            for &item in &self.read_buf[..idx] {
+                if item >= '0' as u8 && item <= '9' as u8 {
+                    multibulklen *= 10;
+                    let cur = item - '0' as u8;
+                    multibulklen += cur as i64;
+                }
+            }
+            self.read_pos = self.read_pos + idx + 2;
+            if multibulklen <= 0 {
+                return Ok(None);
+            }
+            self.multibulklen = multibulklen;
+            self.req.args = Vec::with_capacity(multibulklen as usize);
+        }
+
+        while self.multibulklen != 0 {
+            if self.bulklen == -1 {
+                let idx = match memchr('\r' as u8, self.cur_data()) {
+                    Some(idx) => idx,
+                    _ => {
+                        return Ok(None);
+                    }
+                };
+                if self.peek() != '$' as u8 {
+                    return Err(Error::Redis(RedisError::new()));
+                }
+                if idx == self.cur_data().len() - 1 {
+                    return Ok(None);
+                }
+
+                let mut bulklen: i64 = 0;
+
+                for &item in &self.cur_data()[..idx] {
+                    if item >= '0' as u8 && item <= '9' as u8 {
+                        bulklen *= 10;
+                        let cur = item - '0' as u8;
+                        bulklen += cur as i64;
+                    }
+                }
+                if bulklen == 0 {
+                    return Err(Error::Redis(RedisError::new()));
+                }
+                self.read_pos = self.read_pos + idx + 2;
+
+                self.bulklen = bulklen;
+            }
+
+            if self.read_buf.len() < (self.bulklen + 2) as usize {
+                return Ok(None);
+            }
+
+            if self.req.command.is_empty() {
+                self.req.command = self.slice_len(self.bulklen as usize).to_vec();
+            } else {
+                let mut buf = Vec::with_capacity(self.bulklen as usize);
+                buf.extend_from_slice(self.slice_len(self.bulklen as usize));
+                self.req.args.push(buf);
+            }
+
+            self.read_pos = self.read_pos + self.bulklen as usize + 2;
+
+            self.bulklen = -1;
+            self.multibulklen -= 1;
+        }
+        let req = self.req.clone();
+        self.req.reset();
+        return Ok(Some(req));
+    }
+
+    fn slice_len(&self, len: usize) -> &[u8] {
+        &self.slice_to(self.read_pos + len)
+    }
+
+    fn slice_to(&self, end: usize) -> &[u8] {
+        &self.read_buf[self.read_pos..end]
+    }
+
+    fn cur_data(&self) -> &[u8] {
+        self.slice_to(self.data_pos)
+    }
+
+    fn peek(&self) -> u8 {
+        self.read_buf[self.read_pos]
     }
 }
