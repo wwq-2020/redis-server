@@ -3,16 +3,11 @@ use super::error::Error;
 use std::collections::HashMap;
 use std::str;
 
-
 const OK: &str = "+OK\r\n";
 const COMMAND: &str = "COMMAND";
 const _GET: &str = "GET";
 const SET: &str = "SET";
 const _EMPTY: &str = "$-1\r\n";
-
-pub trait Command<R, E> {
-    fn exec(&mut self, db: AM<DB>) -> Result<R, E>;
-}
 
 #[derive(Clone, Debug)]
 pub struct CmdReq {
@@ -26,17 +21,15 @@ impl CmdReq {
             command: vec![],
             args: vec![],
         }
-
     }
     pub fn reset(&mut self) {
         self.command.clear();
         self.args.clear();
-
     }
 }
 
-impl Command<CmdResp, Error> for CmdReq {
-    fn exec(&mut self, db: AM<DB>) -> Result<CmdResp, Error> {
+impl CmdReq {
+    pub fn exec(&mut self, db: AM<DB>) -> Result<CmdResp, Error> {
         let mut db = db.lock().unwrap();
         let data = db.process_command(&self.command, &self.args)?;
         let mut resp = CmdResp::new();
@@ -59,7 +52,6 @@ impl CmdResp {
     }
 }
 
-
 pub struct DB {
     kv: HashMap<Vec<u8>, Vec<u8>>,
 }
@@ -79,7 +71,6 @@ impl DB {
         if command == COMMAND.as_bytes() {
             return Ok(OK.as_bytes());
         }
-
 
         if command == SET.as_bytes() {
             self.kv.insert(arg[0].clone(), arg[1].clone());
