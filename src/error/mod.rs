@@ -1,23 +1,24 @@
 use std::io;
 use std::net;
 
-
 #[derive(Debug)]
 
-pub struct RedisError {}
+pub struct RedisError {
+    msg: String,
+}
 
 impl RedisError {
-    pub fn new() -> RedisError {
-        RedisError {}
+    pub fn new(msg: String) -> RedisError {
+        RedisError { msg: msg }
     }
 }
+
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
     NetParse(net::AddrParseError),
     Redis(RedisError),
 }
-
 
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Error {

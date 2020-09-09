@@ -1,15 +1,14 @@
-use super::common::AM;
+use super::common::{MyResult, MySimpleResult, AM};
 use super::db::{CmdReq, DB};
 use super::error::{Error, RedisError};
 use memchr::memchr;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub struct Client {
     id: i64,
     conn: TcpStream,
     read_buf: Vec<u8>,
-    write_buf: Vec<u8>,
     read_pos: usize,
     data_pos: usize,
     req_type: ReqType,
@@ -31,7 +30,6 @@ impl Client {
             id: id,
             conn: conn,
             read_buf: [0_u8; 4096].to_vec(),
-            write_buf: Vec::with_capacity(4096),
             read_pos: 0,
             data_pos: 0,
             req_type: ReqType::Init,
@@ -44,11 +42,14 @@ impl Client {
 }
 
 impl Client {
-    pub async fn serve(&mut self) -> Result<(), Error> {
+    pub async fn serve(&mut self) -> MySimpleResult {
         loop {
             let n = self.conn.read(&mut self.read_buf).await?;
             if n == 0 {
-                return Err(Error::Redis(RedisError::new()));
+                return Err(Error::Redis(RedisError::new(format!(
+                    "client_id:{:?} conn closed",
+                    self.id
+                ))));
             }
             self.data_pos += n;
             self.req_type = match self.req_type {
@@ -80,11 +81,11 @@ impl Client {
         }
     }
 
-    fn process_inline_buffer(&mut self) -> Result<Option<CmdReq>, Error> {
+    fn process_inline_buffer(&mut self) -> MyResult<Option<CmdReq>> {
         Ok(Some(CmdReq::new()))
     }
 
-    fn process_multibulk_buffer(&mut self) -> Result<Option<CmdReq>, Error> {
+    fn process_multibulk_buffer(&mut self) -> MyResult<Option<CmdReq>> {
         if self.multibulklen == 0 {
             let idx = match memchr('\r' as u8, self.cur_data()) {
                 Some(idx) => idx,
@@ -94,7 +95,10 @@ impl Client {
             };
 
             if self.peek() != '*' as u8 {
-                return Err(Error::Redis(RedisError::new()));
+                return Err(Error::Redis(RedisError::new(format!(
+                    "client_id:{:?} protocol err, multibulklen start char not *",
+                    self.id
+                ))));
             }
 
             if idx == self.read_buf.len() - 1 {
@@ -127,7 +131,10 @@ impl Client {
                     }
                 };
                 if self.peek() != '$' as u8 {
-                    return Err(Error::Redis(RedisError::new()));
+                    return Err(Error::Redis(RedisError::new(format!(
+                        "client_id:{:?} protocol err, bulklen start char not $",
+                        self.id
+                    ))));
                 }
                 if idx == self.cur_data().len() - 1 {
                     return Ok(None);
@@ -143,7 +150,10 @@ impl Client {
                     }
                 }
                 if bulklen == 0 {
-                    return Err(Error::Redis(RedisError::new()));
+                    return Err(Error::Redis(RedisError::new(format!(
+                        "client_id:{:?} protocol err, bulklen len 0",
+                        self.id
+                    ))));
                 }
                 self.read_pos = self.read_pos + idx + 2;
 
